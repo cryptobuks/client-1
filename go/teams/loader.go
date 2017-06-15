@@ -167,6 +167,7 @@ func (l *TeamLoader) resolveNameToID(ctx context.Context, teamName string) (keyb
 
 type load2ArgT struct {
 	teamID      keybase1.TeamID
+	me          keybase1.UserVersion
 	needAdmin   bool
 	forceRepoll bool
 	needSeqnos  []keybase1.Seqno
@@ -178,6 +179,13 @@ type load2ArgT struct {
 // It's pure, modulo logging.
 func (l *TeamLoader) load2(ctx context.Context, arg load2ArgT) (*keybase1.TeamData, error) {
 	panic("TODO")
+
+	if arg.NeedAdmin {
+		role := TeamSigChainState{inner: res.Chain}.GetUserRole(me)
+		if !(role == keybase1.TeamRole_OWNER || role == keybase1.TeamRole_ADMIN) {
+			return nil, fmt.Errorf("you are not a team admin")
+		}
+	}
 }
 
 func (l *TeamLoader) OnLogout() {
