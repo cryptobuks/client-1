@@ -95,6 +95,10 @@ func (l *TeamLoader) load1(ctx context.Context, me keybase1.UserVersion, lArg ke
 		fromCache = l.storage.Get(ctx, teamID)
 	}
 
+	// TODO this division of load1 and load2 doesn't work.
+	// Load2 DOES need to read from cache
+	// and it DOES need to singleflight!
+
 	var res *keybase1.TeamData
 	res, err = l.load2(ctx, load2ArgT{
 		teamID:      teamID,
@@ -167,25 +171,97 @@ func (l *TeamLoader) resolveNameToID(ctx context.Context, teamName string) (keyb
 
 type load2ArgT struct {
 	teamID      keybase1.TeamID
-	me          keybase1.UserVersion
 	needAdmin   bool
 	forceRepoll bool
 	needSeqnos  []keybase1.Seqno
-	fromCache   *keybase1.TeamData // nil when loading from scratch
+
+	me        keybase1.UserVersion
+	fromCache *keybase1.TeamData // nil when loading from scratch
 }
 
 // Load2 does the rest of the work loading a team.
 // It is `playchain` described by the pseudocode in teamplayer.txt
-// It's pure, modulo logging.
+// It's pure, modulo logging and underlying non-team caches.
 func (l *TeamLoader) load2(ctx context.Context, arg load2ArgT) (*keybase1.TeamData, error) {
-	panic("TODO")
+	ret := arg.fromCache
 
+	// Check the requested constraints from arg against a snapshot.
+	// Used to decide whether to ask for an update even if the cache is fresh.
+	checkConstraints := func(teamData *keybase1.TeamData) error {
+		if arg.NeedAdmin {
+			if !l.satisfiesNeedAdmin(ctx, arg.me, teamData) {
+				// Start from scratch if we are newly admin
+				ret = nil
+			}
+		}
+		panic("TODO: check other constraints")
+	}
+
+	// NeedAdmin is a special constraint where we start from scratch.
+	// Because of admin-only invite links.
 	if arg.NeedAdmin {
-		role := TeamSigChainState{inner: res.Chain}.GetUserRole(me)
-		if !(role == keybase1.TeamRole_OWNER || role == keybase1.TeamRole_ADMIN) {
-			return nil, fmt.Errorf("you are not a team admin")
+		if !l.satisfiesNeedAdmin(ctx, arg.me, teamData) {
+			// Start from scratch if we are newly admin
+			ret = nil
 		}
 	}
+
+	// TODO: wait: it doesn't make sense to do this on the way out because of the lack of return guarantee in needMember.
+	err = checkConstraints(ret)
+	failedRequestConstraints = err != nil
+	if err != nil {
+		s.G().Log.Debug("teams.Loader punching through due to failed constraint: %v", err)
+	}
+	err = nil
+
+	panic("TODO: check load constraints, maybe")
+
+	cacheTooOld := (ret != nil) && l.isFresh(ret.CachedAt)
+	var lastSeqno keybase1.Seqno
+	var lastSigID keybase1.SigID
+	if arg.forceRepoll || (ret == nil) || cacheTooOld || failedRequestConstraints {
+		// Reference the merkle tree to fetch the sigchain tail leaf for the team.
+		lastSeqno, lastSigID, err = l.lookupMerkle(ctx, arg.TeamID)
+	} else {
+		lastSeqno = ret.LastSeqno()
+		lastSigID = ret.LastSigID()
+	}
+
+	// Check admin on the way out.
+	if arg.NeedAdmin {
+		if !l.satisfiesNeedAdmin(ctx, arg.me, ret) {
+			return nil, fmt.Errorf("user is not an admin of the team")
+		}
+	}
+}
+
+// Whether the user is an admin at the snapshot and there are no stubbed links.
+func (l *TeamLoader) satisfiesNeedAdmin(ctx context.Context, me keybase1.UserVersion, teamData keybase1.TeamData) bool {
+	if teamData == nil {
+		return false
+	}
+	role := TeamSigChainState{inner: res.Chain}.GetUserRole(me)
+	if !(role == keybase1.TeamRole_OWNER || role == keybase1.TeamRole_ADMIN) {
+		return false
+	}
+	if (TeamSigChainState{inner: teamData.Chain}.HasAnyStubbedLinks()) {
+		return false
+	}
+	return nil
+}
+
+func (l *TeamLoader) lookupMerkle(ctx context.Context, teamID keybase1.TeamID) (keybase1.Seqno, keybase1.SigID, error) {
+	leaf, err := l.G().GetMerkleClient().LookupTeam(ctx, arg.TeamID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !leaf.TeamID.Eq(teamID) {
+		return nil, nil, fmt.Errorf("merkle returned wrong leaf: %v != %v", leaf.TeamID.String(), teamID.String())
+	}
+	if leaf.Private == nil {
+		return nil, nil, fmt.Errorf("merkle returned nil leaf")
+	}
+	return leaf.Private.Seqno, leaf.Private.LinkID, nil
 }
 
 func (l *TeamLoader) OnLogout() {

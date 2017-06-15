@@ -158,7 +158,6 @@ protocol teams {
     int score;
   }
 
-
   record LoadTeamArg {
     // One of these must be specified.
     // ID is preferred. Name will always hit the server.
