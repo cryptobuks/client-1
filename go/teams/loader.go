@@ -185,17 +185,84 @@ func (l *TeamLoader) load2(ctx context.Context, arg load2ArgT) (*keybase1.TeamDa
 	}
 
 	var lastSeqno keybase1.Seqno
-	var lastSigID keybase1.SigID
+	var lastLinkID keybase1.LinkID
 	if (ret == nil) || repoll {
 		// Reference the merkle tree to fetch the sigchain tail leaf for the team.
-		lastSeqno, lastSigID, err = l.lookupMerkle(ctx, arg.teamID)
+		lastSeqno, lastLinkID, err = l.lookupMerkle(ctx, arg.teamID)
 	} else {
-		panic("TODO: uncomment these lines")
-		// lastSeqno = ret.LastSeqno()
-		// lastSigID = ret.LastSigID()
+		lastSeqno = ret.Chain.LastSeqno
+		lastLinkID = ret.Chain.LastLinkID
 	}
 
-	panic("TODO: the real algorithm")
+	proofSet := newProofSet()
+	var parentChildOperations []parentChildOperation
+
+	// Backfill stubbed links that need to be filled now.
+	if ret != nil && len(arg.needSeqnos) > 0 {
+		ret, proofSet, err = l.fillInStubbedLinks(ret, arg.needSeqnos, proofSet)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Pull new links from the server
+	var teamUpdate *teamUpdateT
+	if ret == nil || ret.Chain.LastSeqno < lastSeqno {
+		low := keybase1.Seqno(0)
+		if ret != nil {
+			low = ret.Chain.LastSeqno
+		}
+		teamUpdate, err = l.getNewLinksFromServer(arg.teamID, low)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	links, err := teamUpdate.links()
+	if err != nil {
+		return nil, err
+	}
+	for _, link := range links {
+		if l.seqnosContains(arg.needSeqnos, link.Seqno) || arg.needAdmin {
+			if link.isStubbed() {
+				return nil, fmt.Errorf("team sigchain link %v stubbed when not allowed", link.Seqno)
+			}
+		}
+
+		proofSet, err = l.verifyLink(ret, link, proofSet)
+		if err != nil {
+			return nil, err
+		}
+
+		if link.IsParentChildOperation() {
+			parentChildOperations = append(parentChildOperations, link.toParentChildOperation())
+		}
+
+		ret, err = l.appendNewLink(ret, link)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if !ret.Chain.LastLinkID.Eq(lastLinkID) {
+		return nil, fmt.Errorf("wrong sigchain link ID: %v != %v",
+			ret.ChainLastLinkID, lastLinkID)
+	}
+
+	err = l.checkParentChildOperations(ret.GetParentID(), parentChildOperations)
+	if err != nil {
+		return nil, err
+	}
+
+	err = l.checkProofs(ret, proofSet)
+	if err != nil {
+		return nil, err
+	}
+
+	ret, err = l.addSecrets(ret, teamUpdate.Box, teamUpdate.Prevs, teamUpdate.ReaderKeyMasks)
+	if err != nil {
+		return nil, err
+	}
 
 	// Cache the validated result
 	ret.CachedAt = NOW()
@@ -313,7 +380,7 @@ func (l *TeamLoader) satisfiesNeedAdmin(ctx context.Context, me keybase1.UserVer
 	if (TeamSigChainState{inner: teamData.Chain}.HasAnyStubbedLinks()) {
 		return false
 	}
-	return nil
+	return true
 }
 
 func (l *TeamLoader) satisfiesNeedSeqnos(ctx context.Context, needSeqnos []keybase1.Seqno, teamData *keybase1.TeamData) error {
@@ -326,7 +393,7 @@ func (l *TeamLoader) satisfiesNeedSeqnos(ctx context.Context, needSeqnos []keyba
 	panic("TODO: implement")
 }
 
-func (l *TeamLoader) lookupMerkle(ctx context.Context, teamID keybase1.TeamID) (keybase1.Seqno, keybase1.SigID, error) {
+func (l *TeamLoader) lookupMerkle(ctx context.Context, teamID keybase1.TeamID) (keybase1.Seqno, keybase1.LinkID, error) {
 	// TODO: make sure this punches through any caches.
 	leaf, err := l.G().GetMerkleClient().LookupTeam(ctx, arg.TeamID)
 	if err != nil {
@@ -339,6 +406,16 @@ func (l *TeamLoader) lookupMerkle(ctx context.Context, teamID keybase1.TeamID) (
 		return nil, nil, fmt.Errorf("merkle returned nil leaf")
 	}
 	return leaf.Private.Seqno, leaf.Private.LinkID, nil
+}
+
+// Whether y is in xs.
+func (l *TeamLoader) seqnosContains(xs []keybase1.Seqnos, y link.seqno) bool {
+	for _, x := range xs {
+		if x.Eq(y) {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *TeamLoader) OnLogout() {
