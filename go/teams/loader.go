@@ -195,7 +195,7 @@ func (l *TeamLoader) load2(ctx context.Context, arg load2ArgT) (*keybase1.TeamDa
 	}
 
 	proofSet := newProofSet()
-	var parentChildOperations []parentChildOperation
+	var parentChildOperations []*parentChildOperation
 
 	// Backfill stubbed links that need to be filled now.
 	if ret != nil && len(arg.needSeqnos) > 0 {
@@ -234,11 +234,11 @@ func (l *TeamLoader) load2(ctx context.Context, arg load2ArgT) (*keybase1.TeamDa
 			return nil, err
 		}
 
-		if link.IsParentChildOperation() {
-			parentChildOperations = append(parentChildOperations, link.toParentChildOperation())
+		if l.isParentChildOperation(&link) {
+			parentChildOperations = append(parentChildOperations, l.toParentChildOperation(&link))
 		}
 
-		ret, err = l.appendNewLink(ret, link)
+		ret, err = l.applyNewLink(ret, link)
 		if err != nil {
 			return nil, err
 		}
@@ -246,10 +246,10 @@ func (l *TeamLoader) load2(ctx context.Context, arg load2ArgT) (*keybase1.TeamDa
 
 	if !ret.Chain.LastLinkID.Eq(lastLinkID) {
 		return nil, fmt.Errorf("wrong sigchain link ID: %v != %v",
-			ret.ChainLastLinkID, lastLinkID)
+			ret.Chain.LastLinkID, lastLinkID)
 	}
 
-	err = l.checkParentChildOperations(ret.GetParentID(), parentChildOperations)
+	err = l.checkParentChildOperations(ret.Chain.ParentID, parentChildOperations)
 	if err != nil {
 		return nil, err
 	}
@@ -409,7 +409,7 @@ func (l *TeamLoader) lookupMerkle(ctx context.Context, teamID keybase1.TeamID) (
 }
 
 // Whether y is in xs.
-func (l *TeamLoader) seqnosContains(xs []keybase1.Seqnos, y link.seqno) bool {
+func (l *TeamLoader) seqnosContains(xs []keybase1.Seqno, y keybase1.Seqno) bool {
 	for _, x := range xs {
 		if x.Eq(y) {
 			return true
