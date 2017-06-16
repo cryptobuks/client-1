@@ -79,30 +79,30 @@ func (l *TeamLoader) load1(ctx context.Context, me keybase1.UserVersion, lArg ke
 	// It is safe for the answer to be wrong because the name is checked on the way out,
 	// and the merkle tree check guarantees one sigchain per team id.
 	if len(lArg.ID) == 0 {
-		teamID, err = l.resolveNameToID(ctx, lArg.Name)
+		teamID, err = l.resolveNameToIDUntrusted(ctx, lArg.Name)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	res, err := l.load2()
-	if err != nil {
-		return nil, err
-	}
-
 	var res *keybase1.TeamData
 	res, err = l.load2(ctx, load2ArgT{
-		teamID:      teamID,
-		needAdmin:   lArg.NeedAdmin,
-		forceRepoll: lArg.ForceRepoll,
-		needSeqnos:  nil,
-		fromCache:   fromCache,
+		teamID: teamID,
+
+		needAdmin:         lArg.NeedAdmin,
+		needKeyGeneration: lArg.NeedKeyGeneration,
+		wantMembers:       lArg.WantMembers,
+		forceFullReload:   lArg.ForceFullReload,
+		forceRepoll:       lArg.ForceRepoll,
+		staleOK:           lArg.StaleOK,
+
+		needSeqnos: nil,
+		me:         me,
 	})
 	if err != nil {
 		return nil, err
 	}
 	if res == nil {
-		// TODO: decide whether load2 can return (nil, err:nil) or not
 		return nil, fmt.Errorf("team loader fault: got nil from load2")
 	}
 
@@ -137,43 +137,96 @@ func (l *TeamLoader) checkArg(ctx context.Context, lArg keybase1.LoadTeamArg) er
 
 // Resolve a team name to a team ID.
 // Will always hit the server for subteams. The server can lie in this return value.
-func (l *TeamLoader) resolveNameToID(ctx context.Context, teamName string) (keybase1.TeamID, error) {
+func (l *TeamLoader) resolveNameToIDUntrusted(ctx context.Context, teamName string) (keybase1.TeamID, error) {
 	// TODO: Resolve the name to team ID.
 	// For root team names, just hash.
 	// For subteams, ask the server.
 	panic("TODO: resolve team name to id")
 }
 
+// Mostly the same as the public keybase.LoadTeamArg
+// but only supports loading by ID, and has neededSeqnos.
 type load2ArgT struct {
-	teamID      keybase1.TeamID
-	needAdmin   bool
-	forceRepoll bool
-	needSeqnos  []keybase1.Seqno
+	teamID keybase1.TeamID
 
-	me        keybase1.UserVersion
-	fromCache *keybase1.TeamData // nil when loading from scratch
+	needAdmin         bool
+	needKeyGeneration int
+	wantMembers       []keybase1.UserVersion
+	forceFullReload   bool
+	forceRepoll       bool
+	staleOK           bool
+
+	needSeqnos []keybase1.Seqno
+
+	me keybase1.UserVersion
 }
 
 // Load2 does the rest of the work loading a team.
 // It is `playchain` described in the pseudocode in teamplayer.txt
 func (l *TeamLoader) load2(ctx context.Context, arg load2ArgT) (*keybase1.TeamData, error) {
+	var err error
+
 	// Single-flight lock by team ID.
 	lock := l.locktab.AcquireOnName(ctx, l.G(), arg.teamID.String())
 	defer lock.Release(ctx)
 
 	// Fetch from cache
 	var ret *keybase1.TeamData
-	if !lArg.ForceFullReload {
+	if !arg.forceFullReload {
 		// Load from cache
-		fromCache = l.storage.Get(ctx, teamID)
+		ret = l.storage.Get(ctx, arg.teamID)
 	}
 
+	// Determine whether to repoll merkle.
+	discardCache, repoll := l.load2DecideRepoll(ctx, arg, ret)
+	if discardCache {
+		ret = nil
+		repoll = true
+	}
+
+	var lastSeqno keybase1.Seqno
+	var lastSigID keybase1.SigID
+	if (ret == nil) || repoll {
+		// Reference the merkle tree to fetch the sigchain tail leaf for the team.
+		lastSeqno, lastSigID, err = l.lookupMerkle(ctx, arg.teamID)
+	} else {
+		panic("TODO: uncomment these lines")
+		// lastSeqno = ret.LastSeqno()
+		// lastSigID = ret.LastSigID()
+	}
+
+	panic("TODO: the real algorithm")
+
+	// Cache the validated result
+	ret.CachedAt = NOW()
+	l.storage.Put(ctx, ret)
+
+	// Check request constraints
+	err = l.load2CheckReturn(ctx, arg, ret)
+	if err != nil {
+		return nil, err
+	}
+
+	return ret, nil
+}
+
+// Decide whether to repoll merkle based on load arg.
+// Returns (discardCache, repoll)
+// If discardCache is true, the caller should throw out their cached copy and repoll.
+// Considers:
+// - NeedAdmin
+// - NeedKeyGeneration
+// - WantMembers
+// - ForceRepoll
+// - Cache freshness / StaleOK
+// - NeedSeqnos
+func (l *TeamLoader) load2DecideRepoll(ctx context.Context, arg load2ArgT, fromCache *keybase1.TeamData) (bool, bool) {
 	// NeedAdmin is a special constraint where we start from scratch.
 	// Because of admin-only invite links.
-	if arg.NeedAdmin {
+	if arg.needAdmin {
 		if !l.satisfiesNeedAdmin(ctx, arg.me, fromCache) {
 			// Start from scratch if we are newly admin
-			ret = nil
+			return true, true
 		}
 	}
 
@@ -181,19 +234,27 @@ func (l *TeamLoader) load2(ctx context.Context, arg load2ArgT) (*keybase1.TeamDa
 	// This starts out false and then there are many reasons for turning it true.
 	repoll := false
 
-	if arg.NeedKeyGeneration > 0 {
+	if arg.forceRepoll {
+		repoll = true
+	}
+
+	// Repoll to get a new key generation
+	if arg.needKeyGeneration > 0 {
 		if !l.satisfiesNeedKeyGeneration(ctx, arg.NeedKeyGeneration, fromCache) {
 			repoll = true
 		}
 	}
 
-	if len(arg.WantMembers) > 0 {
+	// Repoll because it might help get the wanted members
+	if len(arg.wantMembers) > 0 {
 		if !l.satisfiesWantMembers(ctx, arg.WantMembers, fromCache) {
 			repoll = true
 		}
 	}
 
-	if len(arg.NeedSeqnos) > 0 {
+	// Repoll if we need a seqno not in the cache.
+	// Does not force a repoll if we just need to fill in previous links
+	if len(arg.needSeqnos) > 0 {
 		if fromCache == nil {
 			repoll = true
 		} else {
@@ -203,70 +264,41 @@ func (l *TeamLoader) load2(ctx context.Context, arg load2ArgT) (*keybase1.TeamDa
 		}
 	}
 
-	if ret == nil {
+	if fromCache == nil {
 		// We need a merkle leaf when starting from scratch.
 		repoll = true
 	}
 
-	cacheIsOld := (ret != nil) && l.isFresh(ret.CachedAt)
-	if cacheIsOld && !arg.StaleOK && cacheTooOld {
+	cacheIsOld := (fromCache != nil) && l.isFresh(fromCache.CachedAt)
+	if cacheIsOld && !arg.StaleOK {
 		// We need a merkle leaf
 		repoll = true
 	}
 
-	// Check the requested constraints from arg against a snapshot.
-	// Used to decide whether to ask for an update even if the cache is fresh.
-	checkConstraints := func(teamData *keybase1.TeamData) error {
-		if arg.NeedAdmin {
-			if !l.satisfiesNeedAdmin(ctx, arg.me, teamData) {
-				// Start from scratch if we are newly admin
-				ret = nil
-			}
-		}
-		panic("TODO: check other constraints")
-	}
+	return false, repoll
+}
 
-	// TODO: wait: it doesn't make sense to do this on the way out because of the lack of return guarantee in needMember.
-	err = checkConstraints(ret)
-	failedRequestConstraints = err != nil
-	if err != nil {
-		s.G().Log.Debug("teams.Loader punching through due to failed constraint: %v", err)
-	}
-	err = nil
-
-	panic("TODO: check load constraints, maybe")
-
-	cacheTooOld := (ret != nil) && l.isFresh(ret.CachedAt)
-	var lastSeqno keybase1.Seqno
-	var lastSigID keybase1.SigID
-	if arg.forceRepoll || (ret == nil) || cacheTooOld || failedRequestConstraints {
-		// Reference the merkle tree to fetch the sigchain tail leaf for the team.
-		lastSeqno, lastSigID, err = l.lookupMerkle(ctx, arg.TeamID)
-	} else {
-		lastSeqno = ret.LastSeqno()
-		lastSigID = ret.LastSigID()
-	}
-
-	// Check admin on the way out.
-	if arg.NeedAdmin {
-		if !l.satisfiesNeedAdmin(ctx, arg.me, ret) {
-			return nil, fmt.Errorf("user is not an admin of the team")
+// Check whether the load produced a snapshot that can be returned to the caller.
+// This should not check anything that is critical to validity of the snapshot
+// because the snapshot is put into the cache before this check.
+// Considers:
+// - NeedAdmin
+// - NeedKeyGeneration
+func (l *TeamLoader) load2CheckReturn(ctx context.Context, arg load2ArgT, res *keybase1.TeamData) error {
+	if arg.needAdmin {
+		if !l.satisfiesNeedAdmin(ctx, arg.me, res) {
+			l.G().Log.CDebugf(ctx, "user %v is not an admin of team %v at seqno:%v",
+				arg.me, arg.ID, res.GetLatestSeqno())
+			return fmt.Errorf("user is not an admin of the team", arg.me)
 		}
 	}
 
-	// Check key generation on the way out
-	if lArg.NeedKeyGeneration != 0 {
-		if res != nil {
-			foundGen := len(res.PerTeamKeySeeds)
-			if foundGen < lArg.NeedKeyGeneration {
-				return nil, fmt.Errorf("team key generation too low: %v < %v", foundGen, lArg.NeedKeyGeneration)
-			}
+	// Repoll to get a new key generation
+	if arg.needKeyGeneration > 0 {
+		if !l.satisfiesNeedKeyGeneration(ctx, arg.NeedKeyGeneration, res) {
+			return nil, fmt.Errorf("team key generation too low: %v < %v", foundGen, lArg.NeedKeyGeneration)
 		}
 	}
-
-	// Cache the validated result
-	l.storage.Put(ctx, res)
-
 }
 
 // Whether the user is an admin at the snapshot and there are no stubbed links.
@@ -284,13 +316,14 @@ func (l *TeamLoader) satisfiesNeedAdmin(ctx context.Context, me keybase1.UserVer
 	return nil
 }
 
-func (l *TeamLoader) satisfiesNeedSeqnos(ctx, context.Context, needSeqnos []keybase1.Seqno,  teamData *keybase1.TeamData) error {
+func (l *TeamLoader) satisfiesNeedSeqnos(ctx context.Context, needSeqnos []keybase1.Seqno, teamData *keybase1.TeamData) error {
 	if len(needSeqnos) == 0 {
 		return nil
 	}
 	if teamData == nil {
 		return fmt.Errorf("nil team does not contain needed seqnos")
 	}
+	panic("TODO: implement")
 }
 
 func (l *TeamLoader) lookupMerkle(ctx context.Context, teamID keybase1.TeamID) (keybase1.Seqno, keybase1.SigID, error) {
