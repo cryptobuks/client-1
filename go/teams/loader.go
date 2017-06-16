@@ -66,7 +66,7 @@ func (l *TeamLoader) getMe(ctx context.Context) (res keybase1.UserVersion, err e
 	return loadUserVersionByUID(ctx, l.G(), l.G().Env.GetUID())
 }
 
-// Load1 unpacks the loadArg, interacts with storage, and does some final checks.
+// Load1 unpacks the loadArg, calls load2, and does some final checks.
 // The key difference between load1 and load2 is that load2 is recursive (for subteams).
 func (l *TeamLoader) load1(ctx context.Context, me keybase1.UserVersion, lArg keybase1.LoadTeamArg) (*keybase1.TeamData, error) {
 	err := l.checkArg(ctx, lArg)
@@ -85,19 +85,10 @@ func (l *TeamLoader) load1(ctx context.Context, me keybase1.UserVersion, lArg ke
 		}
 	}
 
-	// Single-flight based on team ID.
-	lock := l.locktab.AcquireOnName(ctx, l.G(), teamID.String())
-	defer lock.Release(ctx)
-
-	var fromCache *keybase1.TeamData
-	if !lArg.ForceFullReload {
-		// Load from cache
-		fromCache = l.storage.Get(ctx, teamID)
+	res, err := l.load2()
+	if err != nil {
+		return nil, err
 	}
-
-	// TODO this division of load1 and load2 doesn't work.
-	// Load2 DOES need to read from cache
-	// and it DOES need to singleflight!
 
 	var res *keybase1.TeamData
 	res, err = l.load2(ctx, load2ArgT{
@@ -123,6 +114,7 @@ func (l *TeamLoader) load1(ctx context.Context, me keybase1.UserVersion, lArg ke
 	}
 
 	// Check team name on the way out
+	// It may have already been written to cache, but that should be ok.
 	if len(lArg.Name) > 0 {
 		if res != nil {
 			if lArg.Name != res.Chain.Name {
@@ -130,23 +122,6 @@ func (l *TeamLoader) load1(ctx context.Context, me keybase1.UserVersion, lArg ke
 			}
 		}
 	}
-
-	// Check key generation on the way out
-	if lArg.NeedKeyGeneration != 0 {
-		if res != nil {
-			foundGen := len(res.PerTeamKeySeeds)
-			if foundGen < lArg.NeedKeyGeneration {
-				return nil, fmt.Errorf("team key generation too low: %v < %v", foundGen, lArg.NeedKeyGeneration)
-			}
-		}
-	}
-
-	if res == nil {
-		panic("TODO: is it allowed for res to be nil here?")
-	}
-
-	// Cache the validated result
-	l.storage.Put(ctx, res)
 
 	return res, nil
 }
@@ -180,10 +155,64 @@ type load2ArgT struct {
 }
 
 // Load2 does the rest of the work loading a team.
-// It is `playchain` described by the pseudocode in teamplayer.txt
-// It's pure, modulo logging and underlying non-team caches.
+// It is `playchain` described in the pseudocode in teamplayer.txt
 func (l *TeamLoader) load2(ctx context.Context, arg load2ArgT) (*keybase1.TeamData, error) {
-	ret := arg.fromCache
+	// Single-flight lock by team ID.
+	lock := l.locktab.AcquireOnName(ctx, l.G(), arg.teamID.String())
+	defer lock.Release(ctx)
+
+	// Fetch from cache
+	var ret *keybase1.TeamData
+	if !lArg.ForceFullReload {
+		// Load from cache
+		fromCache = l.storage.Get(ctx, teamID)
+	}
+
+	// NeedAdmin is a special constraint where we start from scratch.
+	// Because of admin-only invite links.
+	if arg.NeedAdmin {
+		if !l.satisfiesNeedAdmin(ctx, arg.me, fromCache) {
+			// Start from scratch if we are newly admin
+			ret = nil
+		}
+	}
+
+	// Whether to hit up merkle for the latest tail.
+	// This starts out false and then there are many reasons for turning it true.
+	repoll := false
+
+	if arg.NeedKeyGeneration > 0 {
+		if !l.satisfiesNeedKeyGeneration(ctx, arg.NeedKeyGeneration, fromCache) {
+			repoll = true
+		}
+	}
+
+	if len(arg.WantMembers) > 0 {
+		if !l.satisfiesWantMembers(ctx, arg.WantMembers, fromCache) {
+			repoll = true
+		}
+	}
+
+	if len(arg.NeedSeqnos) > 0 {
+		if fromCache == nil {
+			repoll = true
+		} else {
+			if fromCache.GetLatestSeqno() < l.seqnosMax(arg.NeedSeqnos) {
+				repoll = true
+			}
+		}
+	}
+
+	if ret == nil {
+		// We need a merkle leaf when starting from scratch.
+		repoll = true
+	}
+
+	cacheIsOld := (ret != nil) && l.isFresh(ret.CachedAt)
+	if cacheIsOld && !arg.StaleOK && cacheTooOld {
+		// We need a merkle leaf
+		repoll = true
+	}
 
 	// Check the requested constraints from arg against a snapshot.
 	// Used to decide whether to ask for an update even if the cache is fresh.
@@ -195,15 +224,6 @@ func (l *TeamLoader) load2(ctx context.Context, arg load2ArgT) (*keybase1.TeamDa
 			}
 		}
 		panic("TODO: check other constraints")
-	}
-
-	// NeedAdmin is a special constraint where we start from scratch.
-	// Because of admin-only invite links.
-	if arg.NeedAdmin {
-		if !l.satisfiesNeedAdmin(ctx, arg.me, teamData) {
-			// Start from scratch if we are newly admin
-			ret = nil
-		}
 	}
 
 	// TODO: wait: it doesn't make sense to do this on the way out because of the lack of return guarantee in needMember.
@@ -233,10 +253,24 @@ func (l *TeamLoader) load2(ctx context.Context, arg load2ArgT) (*keybase1.TeamDa
 			return nil, fmt.Errorf("user is not an admin of the team")
 		}
 	}
+
+	// Check key generation on the way out
+	if lArg.NeedKeyGeneration != 0 {
+		if res != nil {
+			foundGen := len(res.PerTeamKeySeeds)
+			if foundGen < lArg.NeedKeyGeneration {
+				return nil, fmt.Errorf("team key generation too low: %v < %v", foundGen, lArg.NeedKeyGeneration)
+			}
+		}
+	}
+
+	// Cache the validated result
+	l.storage.Put(ctx, res)
+
 }
 
 // Whether the user is an admin at the snapshot and there are no stubbed links.
-func (l *TeamLoader) satisfiesNeedAdmin(ctx context.Context, me keybase1.UserVersion, teamData keybase1.TeamData) bool {
+func (l *TeamLoader) satisfiesNeedAdmin(ctx context.Context, me keybase1.UserVersion, teamData *keybase1.TeamData) bool {
 	if teamData == nil {
 		return false
 	}
@@ -250,7 +284,17 @@ func (l *TeamLoader) satisfiesNeedAdmin(ctx context.Context, me keybase1.UserVer
 	return nil
 }
 
+func (l *TeamLoader) satisfiesNeedSeqnos(ctx, context.Context, needSeqnos []keybase1.Seqno,  teamData *keybase1.TeamData) error {
+	if len(needSeqnos) == 0 {
+		return nil
+	}
+	if teamData == nil {
+		return fmt.Errorf("nil team does not contain needed seqnos")
+	}
+}
+
 func (l *TeamLoader) lookupMerkle(ctx context.Context, teamID keybase1.TeamID) (keybase1.Seqno, keybase1.SigID, error) {
+	// TODO: make sure this punches through any caches.
 	leaf, err := l.G().GetMerkleClient().LookupTeam(ctx, arg.TeamID)
 	if err != nil {
 		return nil, nil, err
