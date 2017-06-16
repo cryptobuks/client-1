@@ -23,6 +23,14 @@ class Conversation extends Component<void, Props, State> {
     showDropOverlay: false,
   }
 
+  componentWillReceiveProps(nextProps: Props) {
+    const convoChanged = this.props.selectedConversationIDKey !== nextProps.selectedConversationIDKey
+    const inSearchChanged = this.props.inSearch !== nextProps.inSearch
+    if ((convoChanged || inSearchChanged) && !nextProps.inSearch) {
+      this.props.onFocusInput()
+    }
+  }
+
   _onDrop = e => {
     const fileList = e.dataTransfer.files
     if (!this.props.selectedConversationIDKey) throw new Error('No conversation')
@@ -100,6 +108,7 @@ class Conversation extends Component<void, Props, State> {
         {offline}
         {this.props.inSearch
           ? <SearchHeader
+              selectedConversationIDKey={this.props.selectedConversationIDKey}
               search={this.props.search}
               onChangeSearchText={this.props.onChangeSearchText}
               usernameText={this.props.searchText}

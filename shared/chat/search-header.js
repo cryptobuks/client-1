@@ -1,11 +1,12 @@
 // @flow
 import React from 'react'
 import * as Creators from '../actions/chat/creators'
+import * as ChatConstants from '../constants/chat'
 import * as SearchConstants from '../constants/searchv3'
 import UserInput from '../searchv3/user-input'
 import ServiceFilter from '../searchv3/services-filter'
 import {Box, Icon} from '../common-adapters'
-import {compose, withState, defaultProps, withHandlers} from 'recompose'
+import {compose, withState, defaultProps, withHandlers, lifecycle} from 'recompose'
 import {connect} from 'react-redux'
 import {globalStyles, globalMargins} from '../styles'
 import {parseUserId, serviceIdToIcon} from '../util/platforms'
@@ -13,6 +14,7 @@ import {parseUserId, serviceIdToIcon} from '../util/platforms'
 import type {TypedState} from '../constants/reducer'
 
 type OwnProps = {
+  selectedConversationIDKey: ChatConstants.ConversationIDKey,
   search: (term: string, service: SearchConstants.Service) => void,
   searchText: string,
   onChangeSearchText: (s: string) => void,
@@ -50,6 +52,7 @@ const SearchHeader = props => {
       <Box style={{...globalStyles.flexBoxRow, alignItems: 'center', minHeight: 48}}>
         <Box style={{flex: 1, marginLeft: globalMargins.medium}}>
           <UserInput
+            ref={props.setInputRef}
             autoFocus={true}
             userItems={props.userItems}
             showAddButton={props.showAddButton}
@@ -78,20 +81,36 @@ const SearchHeader = props => {
 export default compose(
   connect(mapStateToProps, mapDispatchToProps),
   withState('selectedService', '_onSelectService', 'Keybase'),
-  withHandlers({
-    onChangeText: (props: OwnProps & {_onSelectService: Function}) => nextText => {
-      props.onChangeSearchText(nextText)
-      props.search(nextText, props.selectedService)
-    },
-    onSelectService: (props: OwnProps & {_onSelectService: Function}) => nextService => {
-      props._onSelectService(nextService)
-      props.search(props.usernameText, nextService)
-    },
+  withHandlers(() => {
+    let input
+    return {
+      setInputRef: () => el => {
+        input = el
+      },
+      onFocusInput: () => () => {
+        input.focus()
+      },
+      onChangeText: (props: OwnProps & {_onSelectService: Function}) => nextText => {
+        props.onChangeSearchText(nextText)
+        props.search(nextText, props.selectedService)
+      },
+      onSelectService: (props: OwnProps & {_onSelectService: Function}) => nextService => {
+        props._onSelectService(nextService)
+        props.search(props.usernameText, nextService)
+      },
+    }
   }),
   defaultProps({
     placeholder: 'Search for someone',
     showAddButton: false,
     onClickAddButton: () => console.log('todo'),
     userItems: [],
+  }),
+  lifecycle({
+    componentWillReceiveProps(nextProps: OwnProps) {
+      if (this.props.selectedConversationIDKey !== nextProps.selectedConversationIDKey) {
+        this.props.onFocusInput()
+      }
+    },
   })
 )(SearchHeader)
