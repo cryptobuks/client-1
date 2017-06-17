@@ -17,7 +17,7 @@ const amIBeingFollowed = ({config: {followers}}: TypedState, otherUser: string) 
 
 const profileSearchResultArray = createSelector(
   ({profile: {searchResults}}: TypedState) => searchResults,
-  searchResults => (searchResults ? searchResults.toArray() : [])
+  searchResults => (searchResults ? searchResults.toArray() : null)
 )
 
 export {
